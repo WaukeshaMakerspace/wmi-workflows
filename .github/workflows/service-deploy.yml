@@ -1,0 +1,166 @@
+# Reusable deploy for a WMI service scaffolded from wmi-app-template.
+#
+# Infrastructure is provisioned once via SAM (see the service's docs/deploy.md);
+# this ships code only, in test -> migrate -> deploy order, so additive schema
+# changes are in place before the new code runs.
+#
+# The caller must provide, via `secrets: inherit`:
+#   AWS_DEPLOY_ROLE_ARN     assumed through GitHub OIDC, no long-lived keys
+#   MIGRATOR_DATABASE_URL   the scoped <db>_migrator credential, server only
+# and must have a `production` environment on the repository.
+name: Service Deploy
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: >-
+          kebab-case service name. Used for the npm workspace scope
+          (@<app-name>/api) and the Lambda function name (<app-name>-api).
+        type: string
+        required: true
+      db-name:
+        description: MySQL database name. Letters, digits and underscore only.
+        type: string
+        required: true
+      node-version:
+        type: string
+        required: false
+        default: '22'
+      aws-region:
+        type: string
+        required: false
+        default: us-east-2
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        description: IAM role assumed via GitHub OIDC to deploy.
+        required: true
+      MIGRATOR_DATABASE_URL:
+        description: >-
+          The scoped <db>_migrator credential. Server only, no database in the
+          path; db-kit composes it with db-name.
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ppassword"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DATABASE_URL: mysql://root:password@127.0.0.1:3306
+      DATABASE_NAME: ${{ inputs.db-name }}
+      SESSION_SECRET: ci-session-secret-at-least-32-bytes!!
+      KEYMASTER_CLIENT_ID: ci-dummy
+      KEYMASTER_CLIENT_SECRET: ci-dummy
+      KEYMASTER_API_KEY: km_ak_ci_dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run db:ensure
+      - name: Apply migrations, if any exist yet
+        run: |
+          if [ -d packages/database/migrations ]; then
+            npm run db:migrate
+          else
+            echo "No migrations directory yet, skipping."
+          fi
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  # Apply pending migrations BEFORE the code deploys, so additive schema
+  # changes are in place when the new code runs. Connects as the scoped
+  # <db>_migrator user (DDL on this database only, never the RDS master).
+  # Idempotent: a no-op when nothing is pending. Destructive changes still need
+  # expand/contract discipline.
+  migrate:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+      # Same reasoning as CI: a service deploying before its first db:generate
+      # has no migrations folder, and skipping is safe precisely because there
+      # is nothing to apply. A genuine migration failure still stops the deploy
+      # before any code ships.
+      - name: Apply migrations, if any exist yet
+        run: |
+          if [ -d packages/database/migrations ]; then
+            npm run db:migrate
+          else
+            echo "No migrations directory yet, skipping."
+          fi
+        env:
+          DATABASE_URL: ${{ secrets.MIGRATOR_DATABASE_URL }}
+          DATABASE_NAME: ${{ inputs.db-name }}
+
+  deploy-api:
+    needs: migrate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write # OIDC for the AWS role, no long-lived keys
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - run: npm ci
+      # The Lambda bundle imports the workspace packages, so build them first.
+      - run: npm run build --workspace=@${{ inputs.app-name }}/shared && npm run build --workspace=@${{ inputs.app-name }}/database
+      - run: npm run build:lambda --workspace=@${{ inputs.app-name }}/api
+      # Update the already-provisioned function's code. Infrastructure changes
+      # still go through `sam deploy` deliberately.
+      - name: Update the Lambda code
+        run: |
+          cd packages/api/lambda-dist
+          zip -qr ../lambda.zip .
+          aws lambda update-function-code \
+            --function-name ${{ inputs.app-name }}-api \
+            --zip-file fileb://../lambda.zip \
+            --region ${{ inputs.aws-region }}
+
+  deploy-ui:
+    needs: deploy-api
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - run: npm ci
+      - run: npm run deploy:ui

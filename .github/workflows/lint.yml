@@ -1,0 +1,22 @@
+# Static validation of the reusable workflows in this repo.
+#
+# This catches the failure mode that would otherwise reach every service at
+# once: a YAML or expression error in a shared workflow. It does NOT execute
+# them. See the README for what actually validates behaviour.
+name: Lint workflows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
