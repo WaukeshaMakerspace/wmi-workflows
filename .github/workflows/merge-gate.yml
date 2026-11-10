@@ -1,0 +1,144 @@
+# merge-gate: merges a pull request with no human in the loop.
+#
+# Copy to .github/workflows/merge-gate.yml in every repo the Paperclip agents
+# work in. It runs from the default branch only, so a PR cannot change the
+# gate that judges it.
+#
+# A PR merges when all of these hold on its head commit:
+#   - it is open, not a draft, targets the default branch, and was opened by
+#     the builder machine account (vars.BUILDER_LOGIN)
+#   - a check named code-review from the Reviewer App passed
+#   - a check named qa from the QA App passed
+#   - every other check run and commit status passed, was neutral or skipped
+#
+# Triggers: the completion of a code-review or qa check, a manual run for one
+# PR, and a daily sweep over every open builder PR. The sweep exists
+# because GitHub sometimes never starts a run for a check_run event (seen on
+# cyberdyne-sandbox PR 2, 2026-11-06: the code-review completion started no
+# run). Without it a PR whose last check event is dropped stays open forever.
+# Each run bills at least one Actions minute in a private repo, so the sweep
+# costs about 30 minutes a month per repo out of the 2,000 GitHub Free gives
+# each owner (every 6 hours would cost about 120, too much across ~30 repos).
+#
+# The merge is made with the Merger App's token, not GITHUB_TOKEN, because a
+# push made with GITHUB_TOKEN does not start other workflows and the deploy
+# workflow must run on the merge.
+#
+# Needs, at repo level (GitHub Free hides org secrets from private repos;
+# install-gate.sh sets them):
+#   secrets.MERGER_APP_PRIVATE_KEY
+#   vars.MERGER_APP_ID, vars.REVIEWER_APP_SLUG, vars.QA_APP_SLUG,
+#   vars.BUILDER_LOGIN
+name: merge-gate
+
+on:
+  check_run:
+    types: [completed]
+  schedule:
+    - cron: '23 11 * * *'  # 05:23 or 06:23 Central, before the 07:00 sweeps
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to evaluate
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-gate-${{ github.event.check_run.head_sha || inputs.pr || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event.check_run.name == 'code-review' ||
+      github.event.check_run.name == 'qa'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - id: merger
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.MERGER_APP_ID }}
+          private-key: ${{ secrets.MERGER_APP_PRIVATE_KEY }}
+
+      - uses: actions/github-script@v7
+        env:
+          REVIEWER_APP_SLUG: ${{ vars.REVIEWER_APP_SLUG }}
+          QA_APP_SLUG: ${{ vars.QA_APP_SLUG }}
+          BUILDER_LOGIN: ${{ vars.BUILDER_LOGIN }}
+          PR_INPUT: ${{ inputs.pr }}
+        with:
+          github-token: ${{ steps.merger.outputs.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const env = process.env;
+            for (const k of ['REVIEWER_APP_SLUG', 'QA_APP_SLUG', 'BUILDER_LOGIN']) {
+              if (!env[k]) { core.setFailed(`Variable ${k} is not set.`); return; }
+            }
+            const required = { 'code-review': env.REVIEWER_APP_SLUG, qa: env.QA_APP_SLUG };
+
+            const info = (await github.rest.repos.get({ owner, repo })).data;
+            const ok = new Set(['success', 'neutral', 'skipped']);
+            const method = info.allow_squash_merge ? 'squash' : info.allow_merge_commit ? 'merge' : 'rebase';
+
+            let candidates;
+            if (env.PR_INPUT) {
+              candidates = [(await github.rest.pulls.get({ owner, repo, pull_number: Number(env.PR_INPUT) })).data];
+            } else {
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              if (context.eventName === 'schedule') {
+                candidates = open.filter(p => p.user.login === env.BUILDER_LOGIN);
+                core.info(`Sweep: ${candidates.length} open builder PR(s).`);
+              } else {
+                // check_run.pull_requests is empty for fork PRs, so match by head SHA.
+                const head = context.payload.check_run.head_sha;
+                candidates = open.filter(p => p.head.sha === head);
+                if (!candidates.length) core.info('No open PR for this commit.');
+              }
+            }
+
+            const failures = [];
+            for (const pr of candidates) {
+              const tag = `#${pr.number}`;
+              if (pr.state !== 'open') { core.info(`${tag}: not open.`); continue; }
+              const sha = pr.head.sha;
+              if (pr.base.ref !== info.default_branch) { core.info(`${tag}: base ${pr.base.ref} is not the default branch.`); continue; }
+              if (pr.draft) { core.info(`${tag}: draft PR.`); continue; }
+              if (pr.user.login !== env.BUILDER_LOGIN) { core.info(`${tag}: opened by ${pr.user.login}, not the builder account. Left alone.`); continue; }
+
+              const runs = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, filter: 'latest', per_page: 100 });
+              const notPassed = Object.entries(required).find(([name, slug]) => {
+                const run = runs.find(r => r.name === name && r.app && r.app.slug === slug);
+                return !run || run.status !== 'completed' || run.conclusion !== 'success';
+              });
+              if (notPassed) { core.info(`${tag}: ${notPassed[0]} from ${notPassed[1]} has not passed on ${sha}.`); continue; }
+              const other = runs.filter(r => !(r.name in required));
+              const pending = other.filter(r => r.status !== 'completed');
+              const failed = other.filter(r => r.status === 'completed' && !ok.has(r.conclusion));
+              if (pending.length) { core.info(`${tag}: waiting on ${pending.map(r => r.name).join(', ')}.`); continue; }
+              if (failed.length) { core.info(`${tag}: failed ${failed.map(r => r.name).join(', ')}.`); continue; }
+              const status = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha })).data;
+              if (status.total_count > 0 && status.state !== 'success') { core.info(`${tag}: commit status is ${status.state}.`); continue; }
+
+              try {
+                await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, sha, merge_method: method });
+                core.info(`Merged ${tag} at ${sha} by ${method}.`);
+              } catch (e) {
+                // A check_run run and the sweep can race for the same PR.
+                const now = (await github.rest.pulls.get({ owner, repo, pull_number: pr.number })).data;
+                if (now.merged) { core.info(`${tag}: already merged by another gate run.`); continue; }
+                // Say so once per commit, not on every sweep.
+                const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+                const marker = `merge-gate: every check passed on ${sha}`;
+                if (!comments.some(c => c.body && c.body.startsWith(marker))) {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: pr.number,
+                    body: `${marker} but the merge failed: ${e.message}` });
+                }
+                failures.push(`${tag}: ${e.message}`);
+              }
+            }
+            if (failures.length) core.setFailed(failures.join('; '));
