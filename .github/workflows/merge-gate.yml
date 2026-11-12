@@ -16,9 +16,11 @@
 # because GitHub sometimes never starts a run for a check_run event (seen on
 # cyberdyne-sandbox PR 2, 2026-11-06: the code-review completion started no
 # run). Without it a PR whose last check event is dropped stays open forever.
-# Each run bills at least one Actions minute in a private repo, so the sweep
-# costs about 30 minutes a month per repo out of the 2,000 GitHub Free gives
-# each owner (every 6 hours would cost about 120, too much across ~30 repos).
+# Private Kerrsoft-Labs and WaukeshaMakerspace repos run it on hudson, the
+# self-hosted runner at kerr-home, so it bills no Actions minutes there.
+# install-gate.sh rewrites runs-on to ubuntu-latest everywhere else: public
+# repos cannot use hudson's runner group (and run free), and masterprompt has
+# no hudson runner.
 #
 # The merge is made with the Merger App's token, not GITHUB_TOKEN, because a
 # push made with GITHUB_TOKEN does not start other workflows and the deploy
