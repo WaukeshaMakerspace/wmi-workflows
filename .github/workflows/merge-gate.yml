@@ -12,15 +12,19 @@
 #   - every other check run and commit status passed, was neutral or skipped
 #
 # Triggers: the completion of a code-review or qa check, a manual run for one
-# PR, and a daily sweep over every open builder PR. The sweep exists
+# PR, and an hourly sweep over every open builder PR. The sweep exists
 # because GitHub sometimes never starts a run for a check_run event (seen on
 # cyberdyne-sandbox PR 2, 2026-11-06: the code-review completion started no
 # run). Without it a PR whose last check event is dropped stays open forever.
-# Private Kerrsoft-Labs and WaukeshaMakerspace repos run it on hudson, the
-# self-hosted runner at kerr-home, so it bills no Actions minutes there.
-# install-gate.sh rewrites runs-on to ubuntu-latest everywhere else: public
-# repos cannot use hudson's runner group (and run free), and masterprompt has
-# no hudson runner.
+# Hourly since 2026-11-18 (a dropped event on web-platform PR 107 stalled
+# Herald for hours under the daily sweep). install-gate.sh keeps it daily on
+# private repos that run on GitHub-hosted runners, where each run bills a
+# minute (masterprompt's private repos).
+# Private repos run it on a self-hosted runner at kerr-home, so it bills no
+# Actions minutes: WaukeshaMakerspace on hudson (this file's runs-on), and
+# Kerrsoft-Labs on purah, which install-gate.sh writes in. It rewrites runs-on
+# to ubuntu-latest everywhere else: public repos cannot use the self-hosted
+# runner groups (and run free), and masterprompt has no self-hosted runner.
 #
 # The merge is made with the Merger App's token, not GITHUB_TOKEN, because a
 # push made with GITHUB_TOKEN does not start other workflows and the deploy
@@ -37,7 +41,7 @@ on:
   check_run:
     types: [completed]
   schedule:
-    - cron: '23 11 * * *'  # 05:23 or 06:23 Central, before the 07:00 sweeps
+    - cron: '23 * * * *'  # hourly sweep
   workflow_dispatch:
     inputs:
       pr:
